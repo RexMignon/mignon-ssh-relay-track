@@ -1,0 +1,37 @@
+{
+  "RT_VERSION": {
+    "1": {
+      "0000": {
+        "fixed": {
+          "file_version": "1.0.0.0",
+          "product_version": "1.0.0.0"
+        },
+        "info": {
+          "0409": {
+            "ProductName": "Mignon SSH Port Forworder",
+            "FileDescription": "SSH Port Forworder (Built with Wails)",
+            "InternalName": "mignon-ssh-port-forworder-dev.exe",
+            "LegalCopyright": "© 2025 Mignon Rex"
+          }
+        }
+      }
+    }
+  },
+
+  "RT_GROUP_ICON": {
+    "APP": {
+      "0000": "icon.ico"
+    }
+  },
+
+  "RT_MANIFEST": {
+    "1": {
+      "0409": {
+        "execution-level": "as invoker",
+        "identity": {
+          "name": "mignon.ssh.port.forworder"
+        }
+      }
+    }
+  }
+}
