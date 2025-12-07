@@ -80,6 +80,10 @@ func (config *IConfig) ModifyIConfigGroup(Id string, group *IConfigGroup) {
 	if index == -1 {
 		return
 	}
+	if group.Password == "" {
+		group.Password = config.Config[index].Password
+	}
+	group.LinkGroup = config.Config[index].LinkGroup
 	config.Config[index] = *group
 	config.SetValue()
 }
