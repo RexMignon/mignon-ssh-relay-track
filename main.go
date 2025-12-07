@@ -18,8 +18,13 @@ func main() {
 
 	// Create application with options
 	err := wails.Run(&options.App{
-		Title:  "mignon ssh Relay Track",
-		Width:  1024,
+
+		Title: "mignon ssh Relay Track",
+		Width: 1024,
+		SingleInstanceLock: &options.SingleInstanceLock{
+			UniqueId:               "com.mignonframework/mignon-ssh-port-forworder-dev",
+			OnSecondInstanceLaunch: app.onSecondInstanceLaunch,
+		},
 		Height: 768,
 		AssetServer: &assetserver.Options{
 			Assets: assets,

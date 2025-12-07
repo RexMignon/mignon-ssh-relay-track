@@ -6,6 +6,7 @@ import (
 	"fmt"
 
 	"github.com/energye/systray"
+	"github.com/wailsapp/wails/v2/pkg/options"
 	"github.com/wailsapp/wails/v2/pkg/runtime"
 
 	// 引入包
@@ -36,6 +37,12 @@ func NewApp() *App {
 	return &App{
 		errorCounts: make(map[string]int),
 	}
+}
+
+func (a *App) onSecondInstanceLaunch(secondInstanceData options.SecondInstanceData) {
+
+	logging.Logger.Info("==> 收到第二个实例启动信号 <==")
+	runtime.WindowShow(a.ctx)
 }
 
 // Startup is called when the app starts.

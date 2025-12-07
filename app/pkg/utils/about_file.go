@@ -3,11 +3,17 @@ package utils
 import (
 	"errors"
 	"os"
+	"path/filepath"
 )
 
 func ReadFileToString(filePath string) (string, error) {
 	if filePath == "" {
 		return "", errors.New("file path is empty")
+	}
+
+	dir := filepath.Dir(filePath)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return "", err
 	}
 	_, err := os.Stat(filePath)
 	if os.IsNotExist(err) {
