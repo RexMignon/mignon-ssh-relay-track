@@ -4,22 +4,19 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/url"
+	"os"
+	"strings"
 	"sync"
 	"time"
 
 	log "mignon-ssh-port-forworder-dev/app/pkg/logging"
 
 	"golang.org/x/crypto/ssh"
+	"golang.org/x/net/proxy"
 )
 
-// StartReverseSSHTunnel 启动反向隧道 (内网穿透)
-// 相当于: ssh -NR remoteListenAddr:localTargetAddr user@sshAddr
-//
-// 参数说明:
-// sshAddr:        SSH 服务器地址 (e.g., "1.2.3.4:22")
-// user, password: SSH 认证信息
-// remoteListenAddr: 远程服务器上监听的地址 (e.g., "0.0.0.0:8080" 或 "127.0.0.1:8080")
-// localTargetAddr:  本地需要暴露的服务地址 (e.g., "127.0.0.1:3000")
+// StartReverseSSHTunnel 启动反向隧道
 func StartReverseSSHTunnel(sshAddr, user, password, remoteListenAddr, localTargetAddr string) (func(), <-chan error) {
 	errChan := make(chan error, 1)
 	stopCtxChan := make(chan struct{})
@@ -43,9 +40,13 @@ func StartReverseSSHTunnel(sshAddr, user, password, remoteListenAddr, localTarge
 			default:
 			}
 
-			log.Logger.Info(fmt.Sprintf("[RevTunnel-Manager] 正在连接 SSH 并请求远程监听 (尝试: %d/%d)...", retryCount+1, maxRetries))
+			proxyUrl, _ := getProxyURLFromEnv()
+			proxyMsg := "直连"
+			if proxyUrl != nil {
+				proxyMsg = fmt.Sprintf("代理:%s", proxyUrl.Host)
+			}
+			log.Logger.Info(fmt.Sprintf("[RevTunnel-Manager] 正在连接 SSH [%s] (尝试: %d/%d)...", proxyMsg, retryCount+1, maxRetries))
 
-			// 启动反向隧道会话
 			err := runReverseSession(sshAddr, user, password, remoteListenAddr, localTargetAddr, stopCtxChan)
 
 			if err == nil {
@@ -78,7 +79,6 @@ func StartReverseSSHTunnel(sshAddr, user, password, remoteListenAddr, localTarge
 }
 
 func runReverseSession(sshAddr, user, password, remoteListenAddr, localTargetAddr string, stopSignal <-chan struct{}) error {
-	// 1. SSH 配置
 	config := &ssh.ClientConfig{
 		User: user,
 		Auth: []ssh.AuthMethod{
@@ -88,20 +88,38 @@ func runReverseSession(sshAddr, user, password, remoteListenAddr, localTargetAdd
 		Timeout:         5 * time.Second,
 	}
 
-	// 2. 连接 SSH 服务器
-	client, err := ssh.Dial("tcp", sshAddr, config)
+	// --- 修改开始: 使用代理拨号 ---
+	var client *ssh.Client
+	var err error
+
+	proxyDialer := getEnvDialer()
+
+	// 1. 建立底层 TCP 连接
+	conn, err := proxyDialer.Dial("tcp", sshAddr)
 	if err != nil {
-		return err
+		return fmt.Errorf("拨号失败(检查代理): %w", err)
 	}
+
+	// 2. 建立 SSH 连接
+	c, chans, reqs, err := ssh.NewClientConn(conn, sshAddr, config)
+	if err != nil {
+		err := conn.Close()
+		if err != nil {
+			return err
+		}
+		return fmt.Errorf("SSH 握手失败: %w", err)
+	}
+	client = ssh.NewClient(c, chans, reqs)
+	// --- 修改结束 ---
+
 	defer func(client *ssh.Client) {
 		err := client.Close()
 		if err != nil {
-
+			return
 		}
 	}(client)
 
-	// 3. 请求远程服务器监听端口 (这是 -R 的核心)
-	// 注意: 如果 SSHD 配置 GatewayPorts no，这里绑定 0.0.0.0 可能只会生效在 127.0.0.1
+	// 3. 请求远程服务器监听端口
 	remoteListener, err := client.Listen("tcp", remoteListenAddr)
 	if err != nil {
 		return fmt.Errorf("请求远程监听失败 (端口可能被占用): %w", err)
@@ -109,7 +127,7 @@ func runReverseSession(sshAddr, user, password, remoteListenAddr, localTargetAdd
 	defer func(remoteListener net.Listener) {
 		err := remoteListener.Close()
 		if err != nil {
-
+			return
 		}
 	}(remoteListener)
 
@@ -117,7 +135,6 @@ func runReverseSession(sshAddr, user, password, remoteListenAddr, localTargetAdd
 
 	sessionErrChan := make(chan error, 1)
 
-	// 协程 A: 心跳保活 (和 -L 模式一样重要)
 	go func() {
 		ticker := time.NewTicker(30 * time.Second)
 		defer ticker.Stop()
@@ -138,10 +155,8 @@ func runReverseSession(sshAddr, user, password, remoteListenAddr, localTargetAdd
 		}
 	}()
 
-	// 协程 B: 处理来自远程服务器的连接请求
 	go func() {
 		for {
-			// 这里 Accept 的是远程服务器上转过来的连接
 			remoteConn, err := remoteListener.Accept()
 			if err != nil {
 				select {
@@ -154,7 +169,6 @@ func runReverseSession(sshAddr, user, password, remoteListenAddr, localTargetAdd
 				}
 				return
 			}
-			// 处理转发
 			go handleReverseForwarding(remoteConn, localTargetAddr)
 		}
 	}()
@@ -167,7 +181,6 @@ func runReverseSession(sshAddr, user, password, remoteListenAddr, localTargetAdd
 	}
 }
 
-// handleReverseForwarding 将远程来的流量转发给本地服务
 func handleReverseForwarding(remoteConn net.Conn, localTargetAddr string) {
 	defer func(remoteConn net.Conn) {
 		err := remoteConn.Close()
@@ -176,7 +189,6 @@ func handleReverseForwarding(remoteConn net.Conn, localTargetAddr string) {
 		}
 	}(remoteConn)
 
-	// 拨号本地真实服务 (例如 localhost:8080)
 	localConn, err := net.Dial("tcp", localTargetAddr)
 	if err != nil {
 		log.Logger.Error(fmt.Sprintf("[RevForward] 连接本地目标失败 [%s]: %v", localTargetAddr, err))
@@ -189,15 +201,56 @@ func handleReverseForwarding(remoteConn net.Conn, localTargetAddr string) {
 		}
 	}(localConn)
 
-	// 双向拷贝
 	copyConn := func(dst, src net.Conn, result chan<- error) {
 		_, err := io.Copy(dst, src)
 		result <- err
 	}
 
 	resCh := make(chan error, 2)
-	go copyConn(localConn, remoteConn, resCh) // 远程 -> 本地
-	go copyConn(remoteConn, localConn, resCh) // 本地 -> 远程
+	go copyConn(localConn, remoteConn, resCh)
+	go copyConn(remoteConn, localConn, resCh)
 
 	<-resCh
+}
+
+// --- 辅助函数：复制一份在这里，保持包的独立性 ---
+
+func getEnvDialer() proxy.Dialer {
+	u, err := getProxyURLFromEnv()
+	if err != nil || u == nil {
+		return proxy.Direct
+	}
+	// 创建代理 Dialer
+	dialer, err := proxy.FromURL(u, proxy.Direct)
+	if err != nil {
+		log.Logger.Warn(fmt.Sprintf("[Proxy] 代理初始化失败: %v, 使用直连", err))
+		return proxy.Direct
+	}
+	return dialer
+}
+
+func getProxyURLFromEnv() (*url.URL, error) {
+	keys := []string{
+		"ALL_PROXY", "all_proxy",
+		"HTTPS_PROXY", "https_proxy",
+		"HTTP_PROXY", "http_proxy",
+	}
+
+	var proxyStr string
+	for _, key := range keys {
+		if v := os.Getenv(key); v != "" {
+			proxyStr = v
+			break
+		}
+	}
+
+	if proxyStr == "" {
+		return nil, nil
+	}
+
+	if !strings.Contains(proxyStr, "://") {
+		proxyStr = "socks5://" + proxyStr
+	}
+
+	return url.Parse(proxyStr)
 }

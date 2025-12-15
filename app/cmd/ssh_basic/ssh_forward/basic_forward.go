@@ -1,64 +1,59 @@
 package ssh_forward
 
 import (
+	"fmt"
 	"io"
-	log "mignon-ssh-port-forworder-dev/app/pkg/logging"
 	"net"
+	"net/url"
+	"os"
+	"strings"
+	"sync"
 	"time"
 
-	"golang.org/x/crypto/ssh"
-)
+	log "mignon-ssh-port-forworder-dev/app/pkg/logging"
 
-import (
-	"fmt"
-	"sync"
+	"golang.org/x/crypto/ssh"
+	"golang.org/x/net/proxy"
 )
 
 // StartSSHTunnel 启动 SSH 隧道
-// 返回值:
-// 1. stopFunc: 调用此函数以主动停止隧道
-// 2. errorChan: 如果重连超过最大次数，错误会通过此通道发出来（此时隧道已停止）
 func StartSSHTunnel(sshAddr, user, password, localAddr, remoteAddr string) (func(), <-chan error) {
-	// 外部通知通道
 	errChan := make(chan error, 1)
-	// 内部控制通道
 	stopCtxChan := make(chan struct{})
 	var once sync.Once
 
-	// 停止函数
 	stopFunc := func() {
 		once.Do(func() {
 			close(stopCtxChan)
 		})
 	}
 
-	// 守护协程
 	go func() {
 		const maxRetries = 5
 		retryCount := 0
 
-		// 外层循环：负责重连机制
 		for {
 			select {
 			case <-stopCtxChan:
 				log.Logger.Info("[Tunnel-Manager] 用户主动停止隧道")
 				return
 			default:
-				// 继续执行
 			}
 
-			log.Logger.Warn(fmt.Sprintf("[Tunnel-Manager] 尝试建立连接 (尝试次数: %d/%d)...", retryCount+1, maxRetries))
+			// 尝试获取代理地址用于日志打印
+			proxyUrl, _ := getProxyURLFromEnv()
+			proxyMsg := "直连"
+			if proxyUrl != nil {
+				proxyMsg = fmt.Sprintf("代理:%s", proxyUrl.Host)
+			}
+			log.Logger.Warn(fmt.Sprintf("[Tunnel-Manager] 尝试建立连接 [%s] (尝试次数: %d/%d)...", proxyMsg, retryCount+1, maxRetries))
 
-			// 启动单次会话，该函数会阻塞直到连接断开或出错
 			err := runTunnelSession(sshAddr, user, password, localAddr, remoteAddr, stopCtxChan)
 
-			// 判断结果
 			if err == nil {
-				// 正常退出（说明收到了 stopCtxChan 信号）
 				return
 			}
 
-			// 如果是运行中出错，进行重试逻辑
 			log.Logger.Error(fmt.Sprintf("[Tunnel-Manager] 连接意外断开: %v", err))
 			retryCount++
 
@@ -72,7 +67,6 @@ func StartSSHTunnel(sshAddr, user, password, localAddr, remoteAddr string) (func
 				return
 			}
 
-			// 等待一段时间后重连
 			log.Logger.Info("[Tunnel-Manager] 3秒后尝试重连...")
 			select {
 			case <-time.After(3 * time.Second):
@@ -84,10 +78,6 @@ func StartSSHTunnel(sshAddr, user, password, localAddr, remoteAddr string) (func
 	return stopFunc, errChan
 }
 
-// runTunnelSession 负责一次完整的 SSH 连接生命周期
-// 如果连接成功建立并保持，它会阻塞。
-// 如果连接断开或建立失败，它会返回 error。
-// 如果收到 stopSignal，它会返回 nil。
 func runTunnelSession(sshAddr, user, password, localAddr, remoteAddr string, stopSignal <-chan struct{}) error {
 	config := &ssh.ClientConfig{
 		User: user,
@@ -98,19 +88,37 @@ func runTunnelSession(sshAddr, user, password, localAddr, remoteAddr string, sto
 		Timeout:         5 * time.Second,
 	}
 
-	// 1. 建立 SSH 连接
-	client, err := ssh.Dial("tcp", sshAddr, config)
+	// --- 修改开始: 使用代理拨号 ---
+	var client *ssh.Client
+	var err error
+
+	// 1. 获取支持代理的 Dialer
+	proxyDialer := getEnvDialer()
+
+	// 2. 建立底层 TCP 连接
+	conn, err := proxyDialer.Dial("tcp", sshAddr)
 	if err != nil {
-		return err
+		return fmt.Errorf("拨号失败(检查代理设置): %w", err)
 	}
+
+	// 3. 建立 SSH 连接
+	c, chans, reqs, err := ssh.NewClientConn(conn, sshAddr, config)
+	if err != nil {
+		err := conn.Close()
+		if err != nil {
+			return err
+		}
+		return fmt.Errorf("SSH 握手失败: %w", err)
+	}
+	client = ssh.NewClient(c, chans, reqs)
+
 	defer func(client *ssh.Client) {
 		err := client.Close()
 		if err != nil {
-
+			return
 		}
 	}(client)
 
-	// 2. 建立本地监听
 	listener, err := net.Listen("tcp", localAddr)
 	if err != nil {
 		return err
@@ -118,16 +126,14 @@ func runTunnelSession(sshAddr, user, password, localAddr, remoteAddr string, sto
 	defer func(listener net.Listener) {
 		err := listener.Close()
 		if err != nil {
-
+			return
 		}
 	}(listener)
 
 	log.Logger.Info(fmt.Sprintf("[Tunnel-Session] 隧道建立: %s -> %s -> %s", localAddr, sshAddr, remoteAddr))
 
-	// 用于感知内部错误的通道
 	sessionErrChan := make(chan error, 1)
 
-	// 协程 A: 心跳检测
 	go func() {
 		ticker := time.NewTicker(30 * time.Second)
 		defer ticker.Stop()
@@ -148,16 +154,12 @@ func runTunnelSession(sshAddr, user, password, localAddr, remoteAddr string, sto
 		}
 	}()
 
-	// 协程 B: 接收本地连接
 	go func() {
 		for {
 			localConn, err := listener.Accept()
 			if err != nil {
-				// 监听器关闭导致的错误，通常不需要作为 session 错误抛出，除非是异常关闭
-				// 但为了简单，我们假设 Accept 报错就意味着 Listener 坏了
 				select {
 				case <-stopSignal:
-					// 正常停止
 				default:
 					select {
 					case sessionErrChan <- fmt.Errorf("监听器 Accept 错误: %w", err):
@@ -166,12 +168,10 @@ func runTunnelSession(sshAddr, user, password, localAddr, remoteAddr string, sto
 				}
 				return
 			}
-			// 处理单个连接转发，不阻塞 Accept 循环
 			go handleForwarding(client, localConn, remoteAddr)
 		}
 	}()
 
-	// 阻塞等待：要么用户停止，要么发生错误
 	select {
 	case <-stopSignal:
 		return nil
@@ -180,7 +180,6 @@ func runTunnelSession(sshAddr, user, password, localAddr, remoteAddr string, sto
 	}
 }
 
-// handleForwarding 具体的流转发逻辑 (保持你原有的核心逻辑，稍作资源清理优化)
 func handleForwarding(sshClient *ssh.Client, localConn net.Conn, remoteAddr string) {
 	defer func(localConn net.Conn) {
 		err := localConn.Close()
@@ -201,7 +200,6 @@ func handleForwarding(sshClient *ssh.Client, localConn net.Conn, remoteAddr stri
 		}
 	}(remoteConn)
 
-	// 使用 WaitGroup 或 channel 确保双向 copy 完成
 	copyConn := func(dst, src net.Conn, result chan<- error) {
 		_, err := io.Copy(dst, src)
 		result <- err
@@ -211,4 +209,57 @@ func handleForwarding(sshClient *ssh.Client, localConn net.Conn, remoteAddr stri
 	go copyConn(remoteConn, localConn, resCh)
 	go copyConn(localConn, remoteConn, resCh)
 	<-resCh
+}
+
+// --- 辅助函数：从环境变量获取代理 ---
+
+// getEnvDialer 返回一个代理 Dialer 或者直连 Dialer
+func getEnvDialer() proxy.Dialer {
+	u, err := getProxyURLFromEnv()
+	if err != nil || u == nil {
+		return proxy.Direct
+	}
+
+	// 强制把 dialer 当作 SOCKS5 处理 (x/net/proxy 主要支持 socks5)
+	// 如果用户填的是 http://127.0.0.1:7890，我们这里也尝试用 SOCKS5 协议去连这个端口
+	// 因为 SSH 是 TCP 协议，不能走 HTTP 代理
+	dialer, err := proxy.FromURL(u, proxy.Direct)
+	if err != nil {
+		log.Logger.Warn(fmt.Sprintf("[Proxy] 代理地址解析失败: %v, 将使用直连", err))
+		return proxy.Direct
+	}
+	return dialer
+}
+
+// getProxyURLFromEnv 按照优先级读取环境变量
+func getProxyURLFromEnv() (*url.URL, error) {
+	// 优先级: ALL_PROXY > HTTPS_PROXY > HTTP_PROXY (及其小写)
+	keys := []string{
+		"ALL_PROXY", "all_proxy",
+		"HTTPS_PROXY", "https_proxy",
+		"HTTP_PROXY", "http_proxy",
+	}
+
+	var proxyStr string
+	for _, key := range keys {
+		if v := os.Getenv(key); v != "" {
+			proxyStr = v
+			break
+		}
+	}
+
+	if proxyStr == "" {
+		return nil, nil
+	}
+
+	// 容错处理：如果用户没写协议头 (e.g. "127.0.0.1:7890")，默认补上 socks5://
+	if !strings.Contains(proxyStr, "://") {
+		proxyStr = "socks5://" + proxyStr
+	}
+
+	u, err := url.Parse(proxyStr)
+	if err != nil {
+		return nil, err
+	}
+	return u, nil
 }
