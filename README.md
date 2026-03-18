@@ -30,7 +30,7 @@ GatewayPorts clientspecified
 
 4. After saving the file, **restart the SSH service** for the configuration to take effect:
 
-``shell
+```shell
 
 sudo systemctl restart For sshd (Debian) and other distributions, please refer to the documentation.
 
